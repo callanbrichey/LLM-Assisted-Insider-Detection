@@ -1,0 +1,94 @@
+===== ITERATION 1 =====
+
+[DECISION_LOG]
+
+### Step-Back Prompt: Identifying the Underlying Market Microstructure Model
+Based on the features provided—specifically the aggregation of high-frequency timestep statistics (returns, variances, skewness, kurtosis, and net order flow)—the dataset appears to be generated from a **Microstructure-Driven Price Impact Model** (such as an extension of Kyle's (1985) or Amihud's liquidity/order flow framework, combined with stochastic volatility or Garman-Knock/Parkinson-type volatility estimators). 
+
+Specifically, the variables capture:
+1. **Net Order Flow (NOF)**: The imbalance between buyer-initiated and seller-initiated trades at each timestep.
+2. **Returns and Price Changes**: The aggregate price realization resulting from order flow and liquidity shocks.
+3. **Higher Moments (Skewness & Kurtosis)**: Capturing the fat-tailed nature and asymmetry of intraday high-frequency shocks, which are symptomatic of informed trading surges, inventory adjustments by market makers, or liquidity crunches.
+
+**Relevance of Features:**
+- `Daily_Return` & `Price_Change`: Capture the net directional drift of the asset price over the day.
+- `Mean_Log_Return` & `Mean_NetOrderFlow`: Reflect the average drift and directional pressure. Notice that `Return_Skewness` is mathematically identical to `NOF_Skewness` and `Return_Kurtosis` to `NOF_Kurtosis` in the summary stats, pointing to a direct linear or monotonic mapping between order flow distribution shapes and return distribution shapes (price impact linearity).
+- `Return_Variance` & `NOF_Variance`: Measure the intensity of trading activity and volatility.
+- `Signal`: Represents a regime switch, macro-event day, or structural break (e.g., high institutional participation vs. noise-trader dominance) that the model must classify.
+
+### Feature Engineering & Modeling Strategy
+To maximize out-of-sample predictive accuracy, we can engineer features that highlight non-linear interactions and structural anomalies:
+1. **Interaction Ratios**: Ratios of Net Order Flow mean to its standard deviation (Sharpe-like ratio of order flow).
+2. **Volatility-Flow Coupling**: Products and ratios combining variance and mean net order flow.
+3. **Momentum & Higher-Moment Interaction**: Combining skewness and kurtosis with return magnitudes to detect tail-risk events.
+4. **Machine Learning Classifier**: Use an ensemble gradient boosting model (e.g., `LightGBM` or `RandomForestClassifier`), supported by robust standardization and cross-validation, to capture complex decision boundaries without overfitting.
+
+[CODE]
+
+```python
+import pandas as pd
+import numpy as np
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+
+def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
+    df_feat = df.copy()
+    
+    # Drop Day and Signal if present
+    drop_cols = ['Day', 'Signal']
+    feature_cols = [c for c in df_feat.columns if c not in drop_cols]
+    
+    X = df_feat[feature_cols].copy()
+    
+    # Feature Engineering based on microstructure properties
+    # 1. Order Flow Volatility (Standard Deviation from Variance)
+    X['NOF_Std'] = np.sqrt(np.maximum(X['NOF_Variance'], 1e-12))
+    X['Return_Std'] = np.sqrt(np.maximum(X['Return_Variance'], 1e-12))
+    
+    # 2. Order Flow Signal-to-Noise Ratio (Mean NOF / NOF Std)
+    X['NOF_SNR'] = X['Mean_NetOrderFlow'] / (X['NOF_Std'] + 1e-8)
+    
+    # 3. Return to Order Flow Ratio (Price Impact coefficient proxy)
+    X['Price_Impact_Proxy'] = X['Price_Change'] / (X['Mean_NetOrderFlow'].abs() + 1e-8)
+    
+    # 4. Tail Risk Interaction (Kurtosis * Variance)
+    X['Return_Tail_Intensity'] = X['Return_Kurtosis'] * X['Return_Variance']
+    X['NOF_Tail_Intensity'] = X['NOF_Kurtosis'] * X['NOF_Variance']
+    
+    return X
+
+# Global container for trained model and preprocessor
+model_pipeline = None
+
+def train_pred(df: pd.DataFrame) -> pd.DataFrame:
+    global model_pipeline
+    
+    X_train = engineer_features(df)
+    y_train = df['Signal'].astype(int)
+    
+    # Build pipeline with scaling and Random Forest classifier
+    model_pipeline = Pipeline([
+        ('scaler', StandardScaler()),
+        ('clf', RandomForestClassifier(
+            n_estimators=200,
+            max_depth=6,
+            min_samples_split=10,
+            random_state=42,
+            n_jobs=-1
+        ))
+    ])
+    
+    model_pipeline.fit(X_train, y_train)
+    
+    train_preds = model_pipeline.predict(X_train)
+    return pd.DataFrame({'Signal': train_preds}, index=df.index)
+
+def test_pred(df: pd.DataFrame) -> pd.DataFrame:
+    global model_pipeline
+    
+    X_test = engineer_features(df)
+    test_preds = model_pipeline.predict(X_test)
+    
+    return pd.DataFrame({'Signal': test_preds}, index=df.index)
+```

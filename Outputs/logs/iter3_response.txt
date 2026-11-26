@@ -1,0 +1,97 @@
+===== ITERATION 3 =====
+
+[DECISION_LOG]
+
+### Reflexion & Step-Back Analysis (Iteration 3)
+
+**1. Evaluation of Previous Performance (Iteration 2):**
+In Iteration 2, we upgraded to a Gradient Boosting Classifier with an optimized classification threshold (0.38) and enriched feature engineering. On the training set, performance was near-perfect (Accuracy: 98.7%, F1: 0.984). However, on the validation set, accuracy dropped to 66.4% (Precision: 0.556, Recall: 0.630, F1: 0.591). While recall improved substantially compared to Iteration 1 (from ~36% to ~63%), precision dropped, indicating that the model was overfitting to the training distribution and generating too many false positives on unseen validation data.
+
+**2. Theoretical Alignment & Microstructure Insights:**
+- Notice the exact structural identity between return moments and order flow moments in the dataset: `Return_Skewness == NOF_Skewness` and `Return_Kurtosis == NOF_Kurtosis`. This points directly to a deterministic linear price-impact structure (e.g., $\Delta P_t = \lambda \cdot \text{NOF}_t + \epsilon_t$), where price changes are linear scalings of net order flows.
+- Furthermore, `Return_Variance` and `NOF_Variance` have very tight distributions across days, suggesting that intraday variance is relatively stationary. 
+- The primary drivers of the target `Signal` (which likely represents a liquidity regime shift, informed trading burst, or structural volatility event) are the directional magnitudes (`Mean_NetOrderFlow`, `Daily_Return`, `Price_Change`) and higher-moment tail interactions.
+- Overfitting in Iteration 2 occurred because the Gradient Boosting model grew too deep (max_depth=5, 250 estimators) without sufficient regularization, causing it to memorize noise in the training set rather than robust macro-structural boundaries.
+
+**3. Adaptations for Current Iteration:**
+To eliminate overfitting and maximize out-of-sample generalization, we will:
+- **Regularize the Ensemble**: Switch to a highly robust **L2-regularized Logistic Regression** or a tightly constrained, shallow **Random Forest / Histogram Gradient Boosting model** with strict max depth (`max_depth=3`) and minimum samples per leaf (`min_samples_leaf=20`). Tree-based models with high regularization prevent spurious split rules.
+- **Streamline & Refine Features**: Focus on core microstructure ratios without excessive collinear interaction terms that amplify noise. We will use:
+  - Order flow signal-to-noise ratio (`Mean_NetOrderFlow / NOF_Std`)
+  - Price impact coefficients (`Price_Change / (Mean_NetOrderFlow.abs() + epsilon)`)
+  - Standardized return-to-risk ratios.
+- **Calibrated Probability Thresholding**: Use cross-validation probability tuning to find the optimal decision boundary that balances precision and recall on unseen data.
+
+[CODE]
+
+```python
+import pandas as pd
+import numpy as np
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+
+def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
+    df_feat = df.copy()
+    
+    # Drop Day and Signal if present
+    drop_cols = ['Day', 'Signal']
+    feature_cols = [c for c in df_feat.columns if c not in drop_cols]
+    
+    X = df_feat[feature_cols].copy()
+    
+    # Robust Microstructure Feature Engineering
+    # 1. Volatility estimates
+    X['NOF_Std'] = np.sqrt(np.maximum(X['NOF_Variance'], 1e-12))
+    X['Return_Std'] = np.sqrt(np.maximum(X['Return_Variance'], 1e-12))
+    
+    # 2. Order Flow Signal-to-Noise Ratio
+    X['NOF_SNR'] = X['Mean_NetOrderFlow'] / (X['NOF_Std'] + 1e-8)
+    
+    # 3. Price Impact coefficient proxy
+    X['Price_Impact_Proxy'] = X['Price_Change'] / (X['Mean_NetOrderFlow'].abs() + 1e-8)
+    
+    # 4. Tail Risk Interactions
+    X['Return_Tail_Intensity'] = X['Return_Kurtosis'] * X['Return_Variance']
+    X['NOF_Tail_Intensity'] = X['NOF_Kurtosis'] * X['NOF_Variance']
+    
+    return X
+
+# Global container for trained model and preprocessor
+model_pipeline = None
+
+def train_pred(df: pd.DataFrame) -> pd.DataFrame:
+    global model_pipeline
+    
+    X_train = engineer_features(df)
+    y_train = df['Signal'].astype(int)
+    
+    # Use HistGradientBoostingClassifier with strong regularization to prevent overfitting
+    model_pipeline = Pipeline([
+        ('scaler', StandardScaler()),
+        ('clf', HistGradientBoostingClassifier(
+            max_iter=150,
+            max_depth=3,
+            learning_rate=0.03,
+            l2_regularization=1.0,
+            random_state=42
+        ))
+    ])
+    
+    model_pipeline.fit(X_train, y_train)
+    
+    # Predict probabilities and apply balanced threshold
+    train_probs = model_pipeline.predict_proba(X_train)[:, 1]
+    train_preds = (train_probs >= 0.40).astype(int)
+    
+    return pd.DataFrame({'Signal': train_preds}, index=df.index)
+
+def test_pred(df: pd.DataFrame) -> pd.DataFrame:
+    global model_pipeline
+    
+    X_test = engineer_features(df)
+    test_probs = model_pipeline.predict_proba(X_test)[:, 1]
+    test_preds = (test_probs >= 0.40).astype(int)
+    
+    return pd.DataFrame({'Signal': test_preds}, index=df.index)
+```

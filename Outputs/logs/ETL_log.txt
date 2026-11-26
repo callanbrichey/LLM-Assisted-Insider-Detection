@@ -1,0 +1,103 @@
+=====ETL AGENT RESPONSE =====
+
+[DECISION_LOG]
+- **Additional Assumptions**:
+  - `Day`: Represents the trading day identifier. The dataset is ordered chronologically by trading day, and within each day, rows are ordered sequentially by `Timestamp` (or implicitly by their appearance within the day).
+  - `Timestamp`: Intraday sequence identifier resetting each day. Used to sort intraday ticks/bars chronologically.
+  - `Price ($)`: Nominal asset price at each timestep. The closing price for a day is defined as the `Price ($)` of the last recorded timestamp for that day. The opening price is the `Price ($)` of the first recorded timestamp for that day.
+  - `Log Return`: Instantaneous log return between consecutive timesteps.
+  - `NetOrderFlow`: Net order flow per timestep.
+- **Formulas**:
+  - **Sorting**: For each day, sort rows by `Timestamp` ascending.
+  - **Daily_Return**: 
+    - For day $t$ ($t > 1$): $\ln(\text{Close}_t) - \ln(\text{Close}_{t-1})$
+    - For the first day $t=1$: $\ln(\text{Close}_1) - \ln(\text{Open}_1)$
+  - **Price_Change**:
+    - For day $t$ ($t > 1$): $\text{Close}_t - \text{Close}_{t-1}$
+    - For the first day $t=1$: $\text{Close}_1 - \text{Open}_1$
+  - **Mean_Log_Return**: $\frac{1}{N_t} \sum_{i=1}^{N_t} r_{t,i}$ where $r_{t,i}$ is the `Log Return` for timestep $i$ on day $t$.
+  - **Mean_NetOrderFlow**: $\frac{1}{N_t} \sum_{i=1}^{N_t} \text{NOF}_{t,i}$ where $\text{NOF}_{t,i}$ is the `NetOrderFlow` for timestep $i$ on day $t$.
+  - **Return_Variance & NOF_Variance**: Sample variance (Degrees of freedom $= 1$) calculated across all timesteps of a given trading day: $s^2 = \frac{1}{N-1} \sum (x_i - \bar{x})^2$.
+  - **Return_Skewness & NOF_Skewness**: Sample skewness (adjusted Fisher-Pearson standardized moment coefficient $G_1$, using bias correction via scipy/pandas equivalent).
+  - **Return_Kurtosis & NOF_Kurtosis**: Excess kurtosis (Pearson's kurtosis minus 3, standard definition in pandas/scipy `kurt()`).
+- **Statistical Moments Justification**: 
+  - Sample variance, sample skewness, and excess kurtosis (Fisher definition) are chosen as they are the standard statistical estimators in financial data analysis libraries (e.g., Pandas `.var()`, `.skew()`, `.kurt()`) and properly correct for sample size bias.
+- **Five Sanity Checks**:
+  1. The output DataFrame contains exactly one row per unique `Day` present in the input dataset.
+  2. `Daily_Return` and `Price_Change` for the first day use open-to-close, while subsequent days use close-to-close.
+  3. Variance values (`Return_Variance`, `NOF_Variance`) are non-negative ($\ge 0$).
+  4. There are no missing (`NaN`) or infinite values in the output summary table (except potentially if a day has $<2$ observations for variance/higher moments, which should be handled or result in NaN safely).
+  5. The number of rows in the output matches the count of unique days in the input dataset.
+
+[CODE]
+```python
+import pandas as pd
+import numpy as np
+
+def daily_summary(df) -> pd.DataFrame:
+    # Ensure dataframe is sorted chronologically by Day and Timestamp
+    df = df.sort_values(['Day', 'Timestamp']).copy()
+    
+    # Identify unique days in order of appearance
+    days = df['Day'].unique()
+    
+    summary_records = []
+    prev_close = None
+    
+    # Group by Day to process efficiently
+    grouped = df.groupby('Day', sort=False)
+    
+    for day, group in grouped:
+        prices = group['Price ($)'].values
+        open_price = prices[0]
+        close_price = prices[-1]
+        
+        # Daily Return and Price Change
+        if prev_close is None:
+            daily_return = np.log(close_price / open_price)
+            price_change = close_price - open_price
+        else:
+            daily_return = np.log(close_price / prev_close)
+            price_change = close_price - prev_close
+            
+        prev_close = close_price
+        
+        # Log Return statistics
+        log_returns = group['Log Return']
+        mean_log_ret = log_returns.mean()
+        return_var = log_returns.var(ddof=1) if len(log_returns) > 1 else 0.0
+        return_skew = log_returns.skew() if len(log_returns) > 2 else 0.0
+        return_kurt = log_returns.kurt() if len(log_returns) > 3 else 0.0
+        
+        # Net Order Flow statistics
+        nof = group['NetOrderFlow']
+        mean_nof = nof.mean()
+        nof_var = nof.var(ddof=1) if len(nof) > 1 else 0.0
+        nof_skew = nof.skew() if len(nof) > 2 else 0.0
+        nof_kurt = nof.kurt() if len(nof) > 3 else 0.0
+        
+        summary_records.append({
+            'Day': day,
+            'Daily_Return': daily_return,
+            'Price_Change': price_change,
+            'Mean_Log_Return': mean_log_ret,
+            'Return_Variance': return_var,
+            'Return_Skewness': return_skew,
+            'Return_Kurtosis': return_kurt,
+            'Mean_NetOrderFlow': mean_nof,
+            'NOF_Variance': nof_var,
+            'NOF_Skewness': nof_skew,
+            'NOF_Kurtosis': nof_kurt
+        })
+        
+    summary_df = pd.DataFrame(summary_records)
+    
+    # Ensure exact required column order and names
+    expected_columns = [
+        'Day', 'Daily_Return', 'Price_Change', 'Mean_Log_Return', 
+        'Return_Variance', 'Return_Skewness', 'Return_Kurtosis', 
+        'Mean_NetOrderFlow', 'NOF_Variance', 'NOF_Skewness', 'NOF_Kurtosis'
+    ]
+    
+    return summary_df[expected_columns]
+```

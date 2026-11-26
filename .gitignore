@@ -1,0 +1,10 @@
+/_local/
+/.vscode/
+/Outputs/data/synthetic_intraday_market_data.csv
+.env
+.env.*
+*.key
+*.pem
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/

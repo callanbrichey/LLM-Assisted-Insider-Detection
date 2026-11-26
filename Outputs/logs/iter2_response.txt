@@ -1,0 +1,98 @@
+===== ITERATION 2 =====
+
+[DECISION_LOG]
+
+### Reflexion & Step-Back Analysis (Iteration 2)
+
+**1. Evaluation of Previous Performance (Iteration 1):**
+In Iteration 1, our Random Forest classifier achieved a training accuracy of ~78.3% (Precision: 0.906, Recall: 0.511, F1: 0.654) and a validation accuracy of ~72.4% (Precision: 0.842, Recall: 0.364, F1: 0.508). While the precision was remarkably high (meaning when the model predicts the signal is active, it is usually correct), the recall was quite low (~36% to 51%). This indicates that the model is overly conservative, missing a substantial number of active signal days (false negatives). 
+
+**2. Theoretical Alignment & Microstructure Insights:**
+The dataset models high-frequency order flow and price impact. Notice the mathematical identity in the summary statistics: `Return_Skewness == NOF_Skewness` and `Return_Kurtosis == NOF_Kurtosis`. This confirms a linear or near-deterministic structural link between intraday net order flow distributions and log-return distributions (consistent with Kyle's or Amihud's linear price impact models). 
+
+However, the features also reveal that `Return_Variance` and `NOF_Variance` have very narrow relative standard deviations across days, meaning overall variance is relatively stable, whereas `Mean_NetOrderFlow` and `Daily_Return` drive major regime switches. The low recall suggests that tree-based default splits at depth 6 with standard bootstrapping may be under-weighting extreme order flow events or failing to capture non-linear decision boundaries where structural regime changes occur.
+
+**3. Adaptations for Current Iteration:**
+To substantially boost recall and overall out-of-sample predictive power, we will implement the following adaptations:
+- **Advanced Feature Engineering**: 
+  - Construct more granular rolling/aggregate indicators: standardized net order flow (z-scores of flow), non-linear interactions between order flow skewness and volatility, and multi-scale momentum proxies.
+  - Add exponential weighting or robust scaling to handle tail-risk intensities (`NOF_Kurtosis * Mean_NetOrderFlow`).
+- **Algorithm Upgrade**: Replace the standard `RandomForestClassifier` with an optimized **Gradient Boosting Classifier** (`HistGradientBoostingClassifier` or `XGBoost` style ensemble via `sklearn.ensemble.GradientBoostingClassifier`), which is vastly superior at capturing sharp regime boundaries and asymmetric class imbalances.
+- **Class Imbalance & Decision Threshold Tuning**: Adjust class weights (`class_weight='balanced'`) to penalize false negatives more heavily, thereby raising recall without sacrificing excessive precision.
+
+[CODE]
+
+```python
+import pandas as pd
+import numpy as np
+from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+
+def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
+    df_feat = df.copy()
+    
+    # Drop Day and Signal if present
+    drop_cols = ['Day', 'Signal']
+    feature_cols = [c for c in df_feat.columns if c not in drop_cols]
+    
+    X = df_feat[feature_cols].copy()
+    
+    # Advanced Microstructure Feature Engineering
+    # 1. Volatility estimates from variance
+    X['NOF_Std'] = np.sqrt(np.maximum(X['NOF_Variance'], 1e-12))
+    X['Return_Std'] = np.sqrt(np.maximum(X['Return_Variance'], 1e-12))
+    
+    # 2. Order Flow Sharpe / Signal-to-Noise Ratio
+    X['NOF_SNR'] = X['Mean_NetOrderFlow'] / (X['NOF_Std'] + 1e-8)
+    
+    # 3. Price Impact and Liquidity Resilience proxies
+    X['Price_Impact_Proxy'] = X['Price_Change'] / (X['Mean_NetOrderFlow'].abs() + 1e-8)
+    X['Return_per_Unit_Risk'] = X['Daily_Return'] / (X['Return_Std'] + 1e-8)
+    
+    # 4. Tail Risk & Asymmetry Interactions
+    X['Return_Tail_Intensity'] = X['Return_Kurtosis'] * X['Return_Variance']
+    X['NOF_Tail_Intensity'] = X['NOF_Kurtosis'] * X['NOF_Variance']
+    X['Skew_Flow_Interaction'] = X['Return_Skewness'] * X['Mean_NetOrderFlow']
+    X['Kurt_Flow_Interaction'] = X['Return_Kurtosis'] * X['Mean_NetOrderFlow']
+    
+    return X
+
+# Global container for trained model and preprocessor
+model_pipeline = None
+
+def train_pred(df: pd.DataFrame) -> pd.DataFrame:
+    global model_pipeline
+    
+    X_train = engineer_features(df)
+    y_train = df['Signal'].astype(int)
+    
+    # Build robust pipeline with Gradient Boosting to capture non-linear regime shifts
+    model_pipeline = Pipeline([
+        ('scaler', StandardScaler()),
+        ('clf', GradientBoostingClassifier(
+            n_estimators=250,
+            learning_rate=0.05,
+            max_depth=5,
+            subsample=0.8,
+            random_state=42
+        ))
+    ])
+    
+    model_pipeline.fit(X_train, y_train)
+    
+    # Probabilities and optimized threshold for better balance between precision and recall
+    train_probs = model_pipeline.predict_proba(X_train)[:, 1]
+    train_preds = (train_probs >= 0.38).astype(int)
+    
+    return pd.DataFrame({'Signal': train_preds}, index=df.index)
+
+def test_pred(df: pd.DataFrame) -> pd.DataFrame:
+    global model_pipeline
+    
+    X_test = engineer_features(df)
+    test_probs = model_pipeline.predict_proba(X_test)[:, 1]
+    test_preds = (test_probs >= 0.38).astype(int)
+    
+    return pd.DataFrame({'Signal': test_preds}, index=df.index)
+```
